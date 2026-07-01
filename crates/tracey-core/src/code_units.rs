@@ -1127,6 +1127,33 @@ fn svelte_node_kind(kind: &str) -> Option<CodeUnitKind> {
     }
 }
 
+/// Extract code units from Rego source code
+pub fn extract_rego(path: &Path, source: &str) -> CodeUnits {
+    let mut parser = Parser::new();
+    parser
+        .set_language(&arborium_rego::language().into())
+        .expect("Failed to load Rego grammar");
+
+    let Some(tree) = parser.parse(source, None) else {
+        return CodeUnits::new();
+    };
+
+    let mut units = CodeUnits::new();
+    let root = tree.root_node();
+    extract_units_recursive(path, source, root, &mut units, rego_node_kind);
+    units
+}
+
+fn rego_node_kind(kind: &str) -> Option<CodeUnitKind> {
+    match kind {
+        // Only rules become units. The grammar's `package` node is just the
+        // keyword (its name `ref` is a sibling), and `module` spans the whole
+        // file — emitting either would add a noise unit per file.
+        "rule" => Some(CodeUnitKind::Function),
+        _ => None,
+    }
+}
+
 fn extract_units_recursive<F>(
     path: &Path,
     source: &str,
@@ -1225,6 +1252,22 @@ fn find_declarator_name(node: Node) -> Option<Node> {
     }
 }
 
+/// Depth-first search for the first descendant (in document order) whose
+/// kind is one of `kinds`. Checks each node before its children, so a
+/// matching wrapper wins over anything nested inside it.
+fn find_first_descendant<'a>(node: Node<'a>, kinds: &[&str]) -> Option<Node<'a>> {
+    if kinds.contains(&node.kind()) {
+        return Some(node);
+    }
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        if let Some(found) = find_first_descendant(child, kinds) {
+            return Some(found);
+        }
+    }
+    None
+}
+
 fn get_node_name(source: &str, node: Node) -> Option<String> {
     // Try common field names used across languages for the identifier/name
     // Most tree-sitter grammars use "name" for the identifier field
@@ -1242,6 +1285,15 @@ fn get_node_name(source: &str, node: Node) -> Option<String> {
             let mut cursor = node.walk();
             node.children(&mut cursor)
                 .find(|c| c.kind() == "identifier" || c.kind() == "type_identifier")
+        })
+        .or_else(|| {
+            // Rego: the grammar has no fields and no `identifier` kind. A
+            // rule's name is the first `fn_name` (functions) or `var` (all
+            // other rule heads) in document order.
+            match node.kind() {
+                "rule" => find_first_descendant(node, &["fn_name", "var"]),
+                _ => None,
+            }
         })
         .or_else(|| {
             // Julia/similar: name is inside a signature or type_head child
@@ -1291,16 +1343,25 @@ fn extract_req_refs_from_comments(source: &str, node: Node) -> (Vec<RuleId>, Opt
     let mut earliest_comment_line: Option<usize> = None;
 
     // Look for comments that precede this node
-    // Collect all siblings before this node, then walk backwards to find consecutive comments
-    if let Some(parent) = node.parent() {
-        let mut cursor = parent.walk();
+    // Collect all siblings before this node, then walk backwards to find consecutive comments.
+    // If the node is the very first child of a wrapper node (e.g. rego's
+    // `policy` block), a comment above it attaches *outside* the wrapper in
+    // the parse tree — climb until we find a level with preceding siblings.
+    {
+        let mut target = node;
         let mut preceding_siblings: Vec<Node> = Vec::new();
-
-        for child in parent.children(&mut cursor) {
-            if child.id() == node.id() {
+        while let Some(parent) = target.parent() {
+            let mut cursor = parent.walk();
+            for child in parent.children(&mut cursor) {
+                if child.id() == target.id() {
+                    break;
+                }
+                preceding_siblings.push(child);
+            }
+            if !preceding_siblings.is_empty() {
                 break;
             }
-            preceding_siblings.push(child);
+            target = parent;
         }
 
         // Walk backwards through preceding siblings, collecting comments
@@ -3290,6 +3351,75 @@ function helper {
         );
         assert_eq!(refs[0].req_id, "nix.line");
         assert_eq!(refs[1].req_id, "nix.block");
+    }
+
+    #[test]
+    fn test_rego_code_units() {
+        let source = r#"package authz
+
+# r[impl authz.allow.admin]
+allow {
+    input.user.role == "admin"
+}
+
+# r[impl authz.is_admin]
+is_admin(user) {
+    user.role == "admin"
+}
+"#;
+        let units = extract_rego(Path::new("policy.rego"), source);
+
+        let rules: Vec<_> = units
+            .units
+            .iter()
+            .filter(|u| u.kind == CodeUnitKind::Function)
+            .collect();
+        let names: Vec<_> = rules.iter().filter_map(|u| u.name.as_deref()).collect();
+        assert!(names.contains(&"allow"), "rules should be named: {names:?}");
+        assert!(
+            names.contains(&"is_admin"),
+            "function rules should be named: {names:?}"
+        );
+
+        // The first rule's comment attaches outside the `policy` wrapper in
+        // the parse tree; the second's is a plain preceding sibling. Both
+        // association paths must work.
+        for name in ["allow", "is_admin"] {
+            let rule = rules
+                .iter()
+                .find(|u| u.name.as_deref() == Some(name))
+                .unwrap();
+            assert_eq!(
+                rule.req_refs.len(),
+                1,
+                "annotated rule {name} should carry its req ref"
+            );
+        }
+    }
+
+    #[test]
+    fn test_rego_refs() {
+        let source = r#"package authz
+
+# r[impl authz.deny.unauthenticated]
+deny[msg] {
+    not input.user.authenticated
+    msg := "unauthenticated"
+}
+"#;
+        let refs = extract_refs(Path::new("policy.rego"), source);
+        assert_eq!(refs.len(), 1, "Should find the ref in the # comment");
+        assert_eq!(refs[0].req_id, "authz.deny.unauthenticated");
+    }
+
+    #[test]
+    fn test_rego_code_not_treated_as_refs() {
+        // `r[x]` is valid Rego (a rule/set lookup); outside comments it must
+        // not be picked up as an annotation or produce warnings.
+        let source = "package authz\n\nallow {\n    r[input.user]\n}\n";
+        let extracted = extract_refs_with_warnings(Path::new("policy.rego"), source);
+        assert_eq!(extracted.references.len(), 0);
+        assert_eq!(extracted.warnings.len(), 0);
     }
 
     #[test]
